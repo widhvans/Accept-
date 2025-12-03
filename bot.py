@@ -18,12 +18,18 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+logger = logging.getLogger(__name__)
 
 # --- MongoDB Setup ---
 client = MongoClient(config.MONGO_URI)
 db = client['AutoAcceptBot']
 users_col = db['users']
-# Schema: { "user_id": 123, "chats": [-100123, -100456] }
+settings_col = db['settings']  # Stores global bot mode
+pending_col = db['pending_requests']  # Stores requests when in 'Pending' mode
+
+# Ensure default mode exists
+if not settings_col.find_one({"_id": "global_mode"}):
+    settings_col.insert_one({"_id": "global_mode", "value": "upcoming"})
 
 # --- States for Conversation ---
 WAITING_FOR_ID = 1
@@ -36,6 +42,19 @@ def get_user_data(user_id):
         return {"user_id": user_id, "chats": []}
     return data
 
+def get_mode():
+    """Fetches the current operation mode from DB."""
+    setting = settings_col.find_one({"_id": "global_mode"})
+    return setting['value'] if setting else "upcoming"
+
+def set_mode_db(mode_value):
+    """Updates the operation mode in DB."""
+    settings_col.update_one(
+        {"_id": "global_mode"},
+        {"$set": {"value": mode_value}},
+        upsert=True
+    )
+
 # --- Start Command ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -46,6 +65,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 **Hello {user.first_name}!**\n\n"
         f"🆔 **Your ID:** `{user.id}`\n"
         f"🤖 **Bot Status:** Active\n"
+        f"⚙️ **Current Mode:** `{get_mode().title()}`\n"
         f"🔗 **Connected Chats:** {connected_count}/3\n\n"
         "Me upcoming aur pending join requests ko auto-accept kar sakta hu.\n"
         "Shuru karne ke liye neeche button par click karein."
@@ -58,7 +78,107 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
 
-# --- Button Handler ---
+# --- Change Mode Command (Owner Only) ---
+async def change_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    # Security Check: Only Owner
+    if user_id != config.OWNER_ID:
+        await update.message.reply_text("🚫 **Access Denied:** Ye command sirf Bot Owner ke liye hai.")
+        return
+
+    current_mode = get_mode()
+    
+    text = (
+        f"⚙️ **Change Bot Mode**\n\n"
+        f"Current Mode: **{current_mode.title()}**\n\n"
+        "👇 **Select Mode:**\n"
+        "• **Upcoming:** Nayi requests turant accept hongi.\n"
+        "• **Pending:** Requests store hongi (queue), baad me `/accept` se approve karein."
+    )
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("🟢 Upcoming Mode", callback_data="set_mode_upcoming"),
+            InlineKeyboardButton("🟠 Pending Mode", callback_data="set_mode_pending")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+
+async def set_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    # Security Check (Double check in callback)
+    if query.from_user.id != config.OWNER_ID:
+        await query.answer("You are not the owner!", show_alert=True)
+        return
+
+    data = query.data
+    if data == "set_mode_upcoming":
+        set_mode_db("upcoming")
+        new_text = "✅ **Mode Set: Upcoming**\nAb nayi requests turant auto-accept hongi."
+    elif data == "set_mode_pending":
+        set_mode_db("pending")
+        new_text = "✅ **Mode Set: Pending**\nAb nayi requests store ki jayengi. Group me `/accept` likh kar approve karein."
+    
+    await query.edit_message_text(new_text, parse_mode="Markdown")
+
+# --- Accept Command (Group Admin Only) ---
+async def accept_pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    
+    # Ensure command is used in a group/channel context
+    if chat.type == "private":
+        await update.message.reply_text("⚠️ Ye command us Group/Channel me use karein jaha requests accept karni hain.")
+        return
+
+    # Check Admin Rights of User (Basic check)
+    try:
+        member = await chat.get_member(user.id)
+        if member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER] and user.id != config.OWNER_ID:
+            await update.message.reply_text("🚫 Aap is chat ke Admin nahi hain.")
+            return
+    except:
+        pass # If fails, proceed or handle stricter
+
+    status_msg = await update.message.reply_text("⏳ **Checking pending requests database...**", parse_mode="Markdown")
+    
+    # Fetch pending requests for THIS chat from DB
+    pending_requests = list(pending_col.find({"chat_id": chat.id}))
+    
+    if not pending_requests:
+        await status_msg.edit_text("✅ **No Pending Requests found in Database.**\n(Note: Bot sirf wahi requests process kar sakta hai jo 'Pending Mode' ke dauran aayi thi.)")
+        return
+    
+    await status_msg.edit_text(f"🚀 **Processing {len(pending_requests)} requests...**")
+    
+    success_count = 0
+    fail_count = 0
+    
+    for req in pending_requests:
+        try:
+            await context.bot.approve_chat_join_request(chat_id=req['chat_id'], user_id=req['user_id'])
+            success_count += 1
+            # Remove from DB after success
+            pending_col.delete_one({"_id": req['_id']})
+        except Exception as e:
+            logger.error(f"Failed to accept {req['user_id']}: {e}")
+            fail_count += 1
+            # Optional: Remove invalid requests from DB so we don't loop forever?
+            # pending_col.delete_one({"_id": req['_id']}) 
+    
+    await status_msg.edit_text(
+        f"✅ **Operation Completed!**\n\n"
+        f"👥 Total Processed: `{len(pending_requests)}`\n"
+        f"✅ Accepted: `{success_count}`\n"
+        f"❌ Failed/Expired: `{fail_count}`"
+    )
+
+# --- Connect Button Handler ---
 async def connect_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -136,20 +256,38 @@ async def auto_approve_request(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = join_request.chat.id
     user_id = join_request.from_user.id
     
-    # Check if this chat is in our Database (Registered by any user)
-    # Hum check karte hain ki kya ye chat_id kisi bhi user ke document me hai
+    # 1. Check if Chat is Registered in DB
     is_registered = users_col.find_one({"chats": chat_id})
-    
-    if is_registered:
+    if not is_registered:
+        return # Ignore requests from unconnected chats
+
+    # 2. Check Global Mode
+    current_mode = get_mode()
+
+    if current_mode == "upcoming":
+        # Mode: Upcoming -> Auto Accept Immediately
         try:
             await context.bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
-            logging.info(f"Approved user {user_id} in chat {chat_id}")
-            
-            # Optional: User ko PM bhej sakte ho (agar allowed ho)
-            # await context.bot.send_message(user_id, "Your request has been accepted!")
-            
+            logging.info(f"Upcoming Mode: Approved user {user_id} in chat {chat_id}")
         except Exception as e:
-            logging.error(f"Failed to approve: {e}")
+            logging.error(f"Failed to approve {user_id}: {e}")
+
+    elif current_mode == "pending":
+        # Mode: Pending -> Store in DB (Queue), Don't Accept Yet
+        try:
+            # Check if already in queue to avoid duplicates
+            existing = pending_col.find_one({"chat_id": chat_id, "user_id": user_id})
+            if not existing:
+                pending_col.insert_one({
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "date": join_request.date
+                })
+                logging.info(f"Pending Mode: Queued user {user_id} for chat {chat_id}")
+            else:
+                logging.info(f"Pending Mode: User {user_id} already in queue")
+        except Exception as e:
+            logging.error(f"Failed to queue request: {e}")
 
 # --- Main Application ---
 def main():
@@ -166,13 +304,16 @@ def main():
 
     # Handlers Add karna
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("change", change_mode_command)) # New Command
+    application.add_handler(CommandHandler("accept", accept_pending_command)) # New Command
+    application.add_handler(CallbackQueryHandler(set_mode_callback, pattern='^set_mode_')) # New Callback
+    
     application.add_handler(conv_handler)
     
-    # Join Request Handler (Upcoming + Pending*)
-    # *Note: Pending requests tabhi process hongi jab wo trigger hongi ya bot restart hoke fetch karega (API limitation)
+    # Join Request Handler (Handles Logic based on Mode)
     application.add_handler(ChatJoinRequestHandler(auto_approve_request))
 
-    print("🤖 Bot is Running...")
+    print("🤖 Bot is Running with Modes (Upcoming/Pending)...")
     application.run_polling()
 
 if __name__ == '__main__':
