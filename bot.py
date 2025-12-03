@@ -16,7 +16,8 @@ from telegram.ext import (
 from pymongo import MongoClient
 import config
 
-# --- Logging Setup ---
+# --- Logging Setup (Enhanced) ---
+# Info level log console pe dikhega taaki pata chale bot kya kar raha hai
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 client = MongoClient(config.MONGO_URI)
 db = client['AutoAcceptBot']
 users_col = db['users']
-settings_col = db['settings']  
+settings_col = db['settings']
 pending_col = db['pending_requests']
 
 # Ensure default mode exists
@@ -37,7 +38,7 @@ if not settings_col.find_one({"_id": "global_mode"}):
 # --- States for Conversation ---
 WAITING_FOR_ID = 1
 
-# --- HEALTH CHECK SERVER (THE FIX FOR KOYEB) ---
+# --- HEALTH CHECK SERVER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -45,10 +46,9 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is alive and running!")
 
 def start_health_check():
-    # Koyeb/Render usually provide a PORT env variable. Default to 8000.
     port = int(os.environ.get("PORT", 8000))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    print(f"🌍 Health Check Server is listening on port {port}...")
+    logger.info(f"🌍 Health Check Server is listening on port {port}...")
     server.serve_forever()
 
 # --- Helper Functions ---
@@ -82,16 +82,76 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🤖 **Bot Status:** Active\n"
         f"⚙️ **Current Mode:** `{get_mode().title()}`\n"
         f"🔗 **Connected Chats:** {connected_count}/3\n\n"
-        "Me upcoming aur pending join requests ko auto-accept kar sakta hu.\n"
-        "Shuru karne ke liye neeche button par click karein."
+        "**Options:**\n"
+        "1. Connect: Naya group/channel add karein.\n"
+        "2. Disconnect: Existing group ko hatayein.\n"
     )
     
     keyboard = [
-        [InlineKeyboardButton("🔗 Connect Channel/Group", callback_data="connect_chat")]
+        [InlineKeyboardButton("🔗 Connect Chat", callback_data="connect_chat")],
+        [InlineKeyboardButton("❌ Disconnect Chat", callback_data="disconnect_mode")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+
+# --- Disconnect Logic ---
+async def disconnect_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    user_data = get_user_data(user_id)
+    chats = user_data.get("chats", [])
+    
+    if not chats:
+        await query.edit_message_text("❌ **Koi Chat Connected Nahi Hai.**\nPehle connect karein.")
+        return
+
+    keyboard = []
+    for chat_id in chats:
+        try:
+            # Try to fetch chat title
+            chat = await context.bot.get_chat(chat_id)
+            btn_text = f"🗑 {chat.title}"
+        except:
+            # If bot kicked or error, show ID
+            btn_text = f"🗑 {chat_id}"
+        
+        # Callback data format: unlink_123456789
+        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"unlink_{chat_id}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_start")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "❌ **Select Chat to Disconnect:**\nIsse click karne par bot us chat se disconnect ho jayega.",
+        reply_markup=reply_markup
+    )
+
+async def unlink_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data # unlink_-10012345
+    chat_id_to_remove = int(data.split("_")[1])
+    user_id = query.from_user.id
+    
+    # Update DB: Remove chat_id from array
+    result = users_col.update_one(
+        {"user_id": user_id},
+        {"$pull": {"chats": chat_id_to_remove}}
+    )
+    
+    if result.modified_count > 0:
+        await query.edit_message_text(f"✅ **Disconnected!**\nChat ID `{chat_id_to_remove}` remove kar diya gaya hai.", parse_mode="Markdown")
+    else:
+        await query.edit_message_text("❌ **Error:** Chat remove nahi ho paya ya pehle hi hat chuka hai.")
+
+async def back_to_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await start(update, context)
 
 # --- Change Mode Command (Owner Only) ---
 async def change_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -104,199 +164,197 @@ async def change_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = (
         f"⚙️ **Change Bot Mode**\n\n"
         f"Current Mode: **{current_mode.title()}**\n\n"
-        "👇 **Select Mode:**\n"
-        "• **Upcoming:** Nayi requests turant accept hongi.\n"
-        "• **Pending:** Requests store hongi (queue), baad me `/accept` se approve karein."
+        "👇 **Select Mode:**"
     )
-    
     keyboard = [
-        [
-            InlineKeyboardButton("🟢 Upcoming Mode", callback_data="set_mode_upcoming"),
-            InlineKeyboardButton("🟠 Pending Mode", callback_data="set_mode_pending")
-        ]
+        [InlineKeyboardButton("🟢 Upcoming Mode", callback_data="set_mode_upcoming")],
+        [InlineKeyboardButton("🟠 Pending Mode", callback_data="set_mode_pending")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def set_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
     if query.from_user.id != config.OWNER_ID:
-        await query.answer("You are not the owner!", show_alert=True)
+        await query.answer("Not allowed!", show_alert=True)
         return
 
-    data = query.data
-    if data == "set_mode_upcoming":
+    if query.data == "set_mode_upcoming":
         set_mode_db("upcoming")
-        new_text = "✅ **Mode Set: Upcoming**\nAb nayi requests turant auto-accept hongi."
-    elif data == "set_mode_pending":
+        msg = "✅ **Mode: Upcoming**\nNew requests will be auto-accepted immediately."
+    else:
         set_mode_db("pending")
-        new_text = "✅ **Mode Set: Pending**\nAb nayi requests store ki jayengi. Group me `/accept` likh kar approve karein."
+        msg = "✅ **Mode: Pending**\nNew requests will be QUEUED in DB. Use `/accept` to approve."
     
-    await query.edit_message_text(new_text, parse_mode="Markdown")
+    await query.edit_message_text(msg, parse_mode="Markdown")
 
-# --- Accept Command (Group Admin Only) ---
+# --- Accept Command (Enhanced Logic & Logging) ---
 async def accept_pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     
     if chat.type == "private":
-        await update.message.reply_text("⚠️ Ye command us Group/Channel me use karein jaha requests accept karni hain.")
+        await update.message.reply_text("⚠️ Please run this command inside the Group/Channel.")
         return
 
+    # Check Admin
     try:
         member = await chat.get_member(user.id)
         if member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER] and user.id != config.OWNER_ID:
-            await update.message.reply_text("🚫 Aap is chat ke Admin nahi hain.")
+            await update.message.reply_text("🚫 You are not an Admin.")
             return
     except:
         pass 
 
-    status_msg = await update.message.reply_text("⏳ **Checking pending requests database...**", parse_mode="Markdown")
+    status_msg = await update.message.reply_text("⏳ **Fetching pending requests from DB...**", parse_mode="Markdown")
     
+    # Fetch from DB (ensure chat.id is int)
     pending_requests = list(pending_col.find({"chat_id": chat.id}))
     
+    logger.info(f"CMD /accept: Found {len(pending_requests)} requests for chat {chat.id}")
+
     if not pending_requests:
-        await status_msg.edit_text("✅ **No Pending Requests found in Database.**")
+        await status_msg.edit_text(
+            "⚠️ **No Pending Requests Found in Database.**\n\n"
+            "Possible reasons:\n"
+            "1. Bot 'Upcoming Mode' me tha (requests save nahi hue).\n"
+            "2. DB already clear hai.\n"
+            "3. Bot ko requests receive hi nahi hue."
+        )
         return
     
-    await status_msg.edit_text(f"🚀 **Processing {len(pending_requests)} requests...**")
+    await status_msg.edit_text(f"🚀 **Processing {len(pending_requests)} requests... Check Logs!**")
     
     success_count = 0
     fail_count = 0
     
     for req in pending_requests:
+        user_id_target = req['user_id']
         try:
-            await context.bot.approve_chat_join_request(chat_id=req['chat_id'], user_id=req['user_id'])
+            logger.info(f"Attempting to approve user {user_id_target} in chat {chat.id}...")
+            
+            # API CALL
+            await context.bot.approve_chat_join_request(chat_id=chat.id, user_id=user_id_target)
+            
+            logger.info(f"✅ SUCCESS: Approved user {user_id_target}")
             success_count += 1
+            
+            # Delete from DB only on success
             pending_col.delete_one({"_id": req['_id']})
+            
         except Exception as e:
-            logger.error(f"Failed to accept {req['user_id']}: {e}")
+            logger.error(f"❌ FAILED: User {user_id_target} | Error: {e}")
             fail_count += 1
+            # Optional: Delete invalid request so we don't loop it again?
+            # pending_col.delete_one({"_id": req['_id']}) 
     
     await status_msg.edit_text(
-        f"✅ **Operation Completed!**\n\n"
-        f"👥 Total Processed: `{len(pending_requests)}`\n"
+        f"✅ **Batch Process Complete!**\n\n"
+        f"🔢 Total: `{len(pending_requests)}`\n"
         f"✅ Accepted: `{success_count}`\n"
-        f"❌ Failed/Expired: `{fail_count}`"
+        f"❌ Failed: `{fail_count}`\n\n"
+        "Check Logs for details."
     )
 
-# --- Connect Button Handler ---
+# --- Connect & Validation Logic ---
 async def connect_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-    user_data = get_user_data(user_id)
     
-    if len(user_data['chats']) >= 3:
-        await query.edit_message_text("❌ **Limit Reached!**\nAap already 3 channel/group connect kar chuke hain.")
+    if len(get_user_data(query.from_user.id)['chats']) >= 3:
+        await query.edit_message_text("❌ Limit Reached (Max 3). Use Disconnect option.")
         return ConversationHandler.END
 
-    await query.edit_message_text(
-        "📝 **Send Channel/Group ID**\n\n"
-        "Format: `-100xxxxxxxxx`\n\n"
-        "⚠️ **Note:** ID bhejne se pehle, Bot ko us Channel/Group me **Admin** banayein."
-    )
+    await query.edit_message_text("📝 **Send Channel/Group ID** (e.g., `-100xxxx`).\nEnsure Bot is Admin first!")
     return WAITING_FOR_ID
 
-# --- Process ID and Check Admin ---
 async def receive_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id_text = update.message.text.strip()
-    user_id = update.effective_user.id
-    
-    if not chat_id_text.startswith("-100"):
-        await update.message.reply_text("❌ Invalid ID Format! `-100...` se shuru hona chahiye.")
-        return WAITING_FOR_ID
-    
+    text = update.message.text.strip()
     try:
-        chat_id = int(chat_id_text)
+        chat_id = int(text)
     except ValueError:
-        await update.message.reply_text("❌ Ye number nahi hai. Dobara bhejein.")
+        await update.message.reply_text("❌ Invalid ID (Must be integer). Try again.")
         return WAITING_FOR_ID
 
-    status_msg = await update.message.reply_text("⏳ Verifying...")
-
+    msg = await update.message.reply_text("⏳ Verifying Admin rights...")
     try:
-        bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
-        if bot_member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
-            await status_msg.edit_text("❌ Bot is not Admin there! Pehle Bot ko admin banayein.")
+        member = await context.bot.get_chat_member(chat_id, context.bot.id)
+        if member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
+            await msg.edit_text("❌ Bot is not Admin in that chat!")
             return ConversationHandler.END
-
-        users_col.update_one({"user_id": user_id}, {"$addToSet": {"chats": chat_id}})
-        chat_info = await context.bot.get_chat(chat_id)
         
-        await status_msg.edit_text(
-            f"✅ **Success!**\nConnected: **{chat_info.title}** (`{chat_id}`)\nAb is group/channel ki request auto accept hongi."
-        )
+        users_col.update_one({"user_id": update.effective_user.id}, {"$addToSet": {"chats": chat_id}})
+        title = (await context.bot.get_chat(chat_id)).title
+        await msg.edit_text(f"✅ Connected: **{title}**")
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {str(e)}")
+        await msg.edit_text(f"❌ Error: {e}")
     
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚫 Operation Cancelled.")
+    await update.message.reply_text("🚫 Cancelled.")
     return ConversationHandler.END
 
-# --- Auto Accept Logic ---
+# --- Auto Approve Event Handler ---
 async def auto_approve_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    join_request = update.chat_join_request
-    chat_id = join_request.chat.id
-    user_id = join_request.from_user.id
+    jr = update.chat_join_request
+    chat_id = jr.chat.id
+    user_id = jr.from_user.id
     
-    is_registered = users_col.find_one({"chats": chat_id})
-    if not is_registered:
+    # 1. Validation: Is chat connected?
+    if not users_col.find_one({"chats": chat_id}):
         return
 
-    current_mode = get_mode()
-
-    if current_mode == "upcoming":
+    mode = get_mode()
+    
+    if mode == "upcoming":
         try:
             await context.bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
-            logging.info(f"Upcoming Mode: Approved user {user_id}")
+            logger.info(f"✅ [Upcoming Mode] Auto-Approved User {user_id} in Chat {chat_id}")
         except Exception as e:
-            logging.error(f"Failed to approve {user_id}: {e}")
-
-    elif current_mode == "pending":
+            logger.error(f"❌ [Upcoming Mode] Failed {user_id}: {e}")
+            
+    elif mode == "pending":
         try:
-            existing = pending_col.find_one({"chat_id": chat_id, "user_id": user_id})
-            if not existing:
+            if not pending_col.find_one({"chat_id": chat_id, "user_id": user_id}):
                 pending_col.insert_one({
-                    "chat_id": chat_id,
-                    "user_id": user_id,
-                    "date": join_request.date
+                    "chat_id": chat_id, 
+                    "user_id": user_id, 
+                    "date": jr.date
                 })
-                logging.info(f"Pending Mode: Queued user {user_id}")
+                logger.info(f"📥 [Pending Mode] Queued User {user_id} in DB for Chat {chat_id}")
+            else:
+                logger.info(f"⚠️ [Pending Mode] User {user_id} already in queue.")
         except Exception as e:
-            logging.error(f"Failed to queue request: {e}")
+            logger.error(f"❌ [Pending Mode] DB Error: {e}")
 
-# --- Main Application ---
+# --- Main ---
 def main():
-    # 1. Start the Health Check Server in a background thread
-    #    This prevents Koyeb from killing the bot.
-    health_thread = Thread(target=start_health_check, daemon=True)
-    health_thread.start()
-
-    # 2. Start the Bot
-    application = ApplicationBuilder().token(config.BOT_TOKEN).build()
-
-    conv_handler = ConversationHandler(
+    Thread(target=start_health_check, daemon=True).start()
+    
+    app = ApplicationBuilder().token(config.BOT_TOKEN).build()
+    
+    conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(connect_button, pattern='^connect_chat$')],
-        states={
-            WAITING_FOR_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_chat_id)],
-        },
+        states={WAITING_FOR_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_chat_id)]},
         fallbacks=[CommandHandler('cancel', cancel)]
     )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("change", change_mode_command))
-    application.add_handler(CommandHandler("accept", accept_pending_command))
-    application.add_handler(CallbackQueryHandler(set_mode_callback, pattern='^set_mode_'))
-    application.add_handler(conv_handler)
-    application.add_handler(ChatJoinRequestHandler(auto_approve_request))
-
-    print("🤖 Bot is Running with Modes (Upcoming/Pending)...")
-    application.run_polling()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("change", change_mode_command))
+    app.add_handler(CommandHandler("accept", accept_pending_command))
+    
+    app.add_handler(CallbackQueryHandler(disconnect_mode_handler, pattern='^disconnect_mode$'))
+    app.add_handler(CallbackQueryHandler(unlink_chat_handler, pattern='^unlink_'))
+    app.add_handler(CallbackQueryHandler(back_to_start, pattern='^back_to_start$'))
+    app.add_handler(CallbackQueryHandler(set_mode_callback, pattern='^set_mode_'))
+    
+    app.add_handler(conv)
+    app.add_handler(ChatJoinRequestHandler(auto_approve_request))
+    
+    print("🤖 Bot is Running...")
+    app.run_polling()
 
 if __name__ == '__main__':
     main()
